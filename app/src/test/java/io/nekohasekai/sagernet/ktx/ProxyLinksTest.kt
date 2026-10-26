@@ -156,4 +156,13 @@ class ProxyLinksTest {
             toClashSubscriptionLink("https://example.com/sub?token=a")
         )
     }
+    @Test
+    fun largeSubscriptionSurvivesOneInvalidLink() {
+        // Upstream #1130: one bad entry must not reject a 650-node subscription.
+        val valid = (1..650).map { "vless://node-$it" }
+        val result = collect((valid + "vless://broken").joinToString("\n"))
+        assertEquals(valid, result.result.proxies)
+        assertEquals(1, result.result.skipped[INVALID_PROXY_LINK])
+    }
+
 }

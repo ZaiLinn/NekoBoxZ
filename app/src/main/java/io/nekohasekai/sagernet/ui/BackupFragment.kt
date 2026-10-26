@@ -1,5 +1,6 @@
 package io.nekohasekai.sagernet.ui
 
+import io.nekohasekai.sagernet.utils.BoundedInput
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -16,7 +17,7 @@ import com.jakewharton.processphoenix.ProcessPhoenix
 import io.nekohasekai.sagernet.BuildConfig
 import io.nekohasekai.sagernet.R
 import io.nekohasekai.sagernet.SagerNet
-import io.nekohasekai.sagernet.bg.Executable
+import io.nekohasekai.sagernet.bg.ServiceStopper
 import io.nekohasekai.sagernet.database.*
 import io.nekohasekai.sagernet.database.preference.KeyValuePair
 import io.nekohasekai.sagernet.database.preference.PublicDatabase
@@ -201,7 +202,7 @@ class BackupFragment : NamedFragment(R.layout.layout_backup) {
 
         val content = try {
             JSONObject((requireContext().contentResolver.openInputStream(file) ?: return).use {
-                it.bufferedReader().readText()
+                String(BoundedInput.read(it, BoundedInput.MAX_TEXT), Charsets.UTF_8)
             })
         } catch (e: Exception) {
             Logs.w(e)
@@ -228,7 +229,6 @@ class BackupFragment : NamedFragment(R.layout.layout_backup) {
             MaterialAlertDialogBuilder(requireContext()).setTitle(R.string.backup_import)
                 .setView(import.root)
                 .setPositiveButton(R.string.backup_import) { _, _ ->
-                    SagerNet.stopService()
 
                     val binding = LayoutProgressBinding.inflate(layoutInflater)
                     binding.content.text = getString(R.string.backup_importing)
@@ -238,13 +238,15 @@ class BackupFragment : NamedFragment(R.layout.layout_backup) {
                         .show()
                     runOnDefaultDispatcher {
                         runCatching {
-                            finishImport(
+                            val plan = BackupRestore.parse(
                                 content,
                                 import.backupConfigurations.isChecked,
                                 import.backupRules.isChecked,
                                 import.backupSettings.isChecked
                             )
-                            triggerFullRestart(requireContext())
+                            ServiceStopper.stopAndWait()
+                            BackupRestore.restore(plan)
+                            onMainDispatcher { triggerFullRestart(requireContext()) }
                         }.onFailure {
                             Logs.w(it)
                             onMainDispatcher {
@@ -262,64 +264,7 @@ class BackupFragment : NamedFragment(R.layout.layout_backup) {
         }
     }
 
-    fun finishImport(
-        content: JSONObject, profile: Boolean, rule: Boolean, setting: Boolean
-    ) {
-        if (profile && content.has("profiles")) {
-            val profiles = mutableListOf<ProxyEntity>()
-            val jsonProfiles = content.getJSONArray("profiles")
-            for (i in 0 until jsonProfiles.length()) {
-                val data = Util.b64Decode(jsonProfiles[i] as String)
-                val parcel = Parcel.obtain()
-                parcel.unmarshall(data, 0, data.size)
-                parcel.setDataPosition(0)
-                profiles.add(ProxyEntity.CREATOR.createFromParcel(parcel))
-                parcel.recycle()
-            }
-            SagerDatabase.proxyDao.reset()
-            SagerDatabase.proxyDao.insert(profiles)
-
-            val groups = mutableListOf<ProxyGroup>()
-            val jsonGroups = content.getJSONArray("groups")
-            for (i in 0 until jsonGroups.length()) {
-                val data = Util.b64Decode(jsonGroups[i] as String)
-                val parcel = Parcel.obtain()
-                parcel.unmarshall(data, 0, data.size)
-                parcel.setDataPosition(0)
-                groups.add(ProxyGroup.CREATOR.createFromParcel(parcel))
-                parcel.recycle()
-            }
-            SagerDatabase.groupDao.reset()
-            SagerDatabase.groupDao.insert(groups)
-        }
-        if (rule && content.has("rules")) {
-            val rules = mutableListOf<RuleEntity>()
-            val jsonRules = content.getJSONArray("rules")
-            for (i in 0 until jsonRules.length()) {
-                val data = Util.b64Decode(jsonRules[i] as String)
-                val parcel = Parcel.obtain()
-                parcel.unmarshall(data, 0, data.size)
-                parcel.setDataPosition(0)
-                rules.add(ParcelizeBridge.createRule(parcel))
-                parcel.recycle()
-            }
-            SagerDatabase.rulesDao.reset()
-            SagerDatabase.rulesDao.insert(rules)
-        }
-        if (setting && content.has("settings")) {
-            val settings = mutableListOf<KeyValuePair>()
-            val jsonSettings = content.getJSONArray("settings")
-            for (i in 0 until jsonSettings.length()) {
-                val data = Util.b64Decode(jsonSettings[i] as String)
-                val parcel = Parcel.obtain()
-                parcel.unmarshall(data, 0, data.size)
-                parcel.setDataPosition(0)
-                settings.add(KeyValuePair.CREATOR.createFromParcel(parcel))
-                parcel.recycle()
-            }
-            PublicDatabase.kvPairDao.reset()
-            PublicDatabase.kvPairDao.insert(settings)
-        }
+    fun finishImport(content: JSONObject, profile: Boolean, rule: Boolean, setting: Boolean) {
+        BackupRestore.restore(BackupRestore.parse(content, profile, rule, setting))
     }
-
 }

@@ -10,8 +10,6 @@ com.alphainventor.filemanager
 com.amazon.kindle
 com.amazon.mshop.android.shopping
 com.android.chrome
-com.android.providers.downloads
-com.android.providers.downloads.ui
 com.android.providers.telephony
 com.android.settings
 com.android.vending

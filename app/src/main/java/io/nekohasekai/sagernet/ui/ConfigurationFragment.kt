@@ -1,5 +1,6 @@
 package io.nekohasekai.sagernet.ui
 
+import io.nekohasekai.sagernet.utils.BoundedInput
 import android.annotation.SuppressLint
 import android.content.Intent
 import android.graphics.Color
@@ -301,23 +302,27 @@ class ConfigurationFragment @JvmOverloads constructor(
                     var skipped = 0
                     if (fileName != null && fileName.endsWith(".zip")) {
                         // try parse wireguard zip
-                        val zip =
-                            ZipInputStream(requireContext().contentResolver.openInputStream(file)!!)
-                        while (true) {
-                            val entry = zip.nextEntry ?: break
-                            if (entry.isDirectory) continue
-                            val fileText = zip.bufferedReader().readText()
-                            RawUpdater.parseRawResult(fileText, entry.name)?.let { result ->
-                                proxies.addAll(result.proxies)
-                                skipped += result.skippedCount
+                        ZipInputStream(requireContext().contentResolver.openInputStream(file)!!).use { zip ->
+                            var total = 0
+                            var entries = 0
+                            while (true) {
+                                val entry = zip.nextEntry ?: break
+                                if (entry.isDirectory) continue
+                                require(++entries <= BoundedInput.MAX_ENTRIES) { "Too many ZIP entries" }
+                                val bytes = BoundedInput.read(zip, BoundedInput.MAX_TEXT - total)
+                                total += bytes.size
+                                val fileText = String(bytes, Charsets.UTF_8)
+                                RawUpdater.parseRawResult(fileText, entry.name)?.let { result ->
+                                    proxies.addAll(result.proxies)
+                                    skipped += result.skippedCount
+                                }
+                                zip.closeEntry()
                             }
-                            zip.closeEntry()
                         }
-                        zip.closeQuietly()
                     } else {
                         val fileText =
                             requireContext().contentResolver.openInputStream(file)!!.use {
-                                it.bufferedReader().readText()
+                                String(BoundedInput.read(it, BoundedInput.MAX_TEXT), Charsets.UTF_8)
                             }
                         RawUpdater.parseRawResult(fileText, fileName ?: "")?.let { result ->
                             proxies.addAll(result.proxies)

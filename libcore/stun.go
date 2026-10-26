@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"libcore/device"
 	"libcore/stun"
 )
 
@@ -12,9 +13,10 @@ type StunResult struct {
 	Success bool
 }
 
-func StunTest(server string) *StunResult {
+func StunTest(server string) (ret *StunResult) {
 	//note: this library doesn't support stun1.l.google.com:19302
-	ret := &StunResult{}
+	ret = &StunResult{}
+	defer device.DeferPanicToError("StunTest", func(err error) { ret.Success = false; ret.Text = err.Error() })
 	var text string
 
 	// Old NAT Type Test

@@ -8,7 +8,7 @@ import io.nekohasekai.sagernet.fmt.hysteria.HysteriaBean
 import io.nekohasekai.sagernet.fmt.tuic.TuicBean
 import io.nekohasekai.sagernet.ktx.Logs
 import io.nekohasekai.sagernet.ktx.runOnDefaultDispatcher
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.*
 import moe.matsuri.nb4a.utils.JavaUtil
 
 class ProxyInstance(profile: ProxyEntity, var service: BaseService.Interface? = null) :
@@ -21,6 +21,7 @@ class ProxyInstance(profile: ProxyEntity, var service: BaseService.Interface? = 
 
     // for TrafficLooper
     var looper: TrafficLooper? = null
+    private val trafficScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     override fun buildConfig() {
         super.buildConfig()
@@ -39,10 +40,6 @@ class ProxyInstance(profile: ProxyEntity, var service: BaseService.Interface? = 
 
     override suspend fun init() {
         super.init()
-        pluginConfigs.forEach { (_, plugin) ->
-            val (_, content) = plugin
-            Logs.d(content)
-        }
     }
 
     override suspend fun loadConfig() {
@@ -52,10 +49,8 @@ class ProxyInstance(profile: ProxyEntity, var service: BaseService.Interface? = 
     override fun launch() {
         box.setAsMain()
         super.launch() // start box
-        runOnDefaultDispatcher {
-            looper = service?.let { TrafficLooper(it.data, this) }
-            looper?.start()
-        }
+        looper = service?.let { TrafficLooper(it.data, trafficScope) }
+        looper?.start()
     }
 
     override fun close() {
@@ -64,6 +59,7 @@ class ProxyInstance(profile: ProxyEntity, var service: BaseService.Interface? = 
             looper?.stop()
             looper = null
         }
+        trafficScope.cancel()
         super.close()
     }
 

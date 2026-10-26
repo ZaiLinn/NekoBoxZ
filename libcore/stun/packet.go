@@ -48,23 +48,37 @@ func newPacketFromBytes(packetBytes []byte) (*packet, error) {
 	if len(packetBytes) > math.MaxUint16+20 {
 		return nil, errors.New("Received data length too long.")
 	}
+	declared := int(binary.BigEndian.Uint16(packetBytes[2:4]))
+	if packetBytes[0]&0xc0 != 0 || declared != len(packetBytes)-20 || declared%4 != 0 {
+		return nil, errors.New("invalid STUN header length")
+	}
+	if binary.BigEndian.Uint32(packetBytes[4:8]) != magicCookie {
+		return nil, errors.New("invalid STUN magic cookie")
+	}
 	pkt := new(packet)
 	pkt.types = binary.BigEndian.Uint16(packetBytes[0:2])
-	pkt.length = binary.BigEndian.Uint16(packetBytes[2:4])
 	pkt.transID = packetBytes[4:20]
-	pkt.attributes = make([]attribute, 0, 10)
-	packetBytes = packetBytes[20:]
-	for pos := uint16(0); pos+4 < uint16(len(packetBytes)); {
-		types := binary.BigEndian.Uint16(packetBytes[pos : pos+2])
-		length := binary.BigEndian.Uint16(packetBytes[pos+2 : pos+4])
-		end := pos + 4 + length
-		if end < pos+4 || end > uint16(len(packetBytes)) {
-			return nil, errors.New("Received data format mismatch.")
+	body := packetBytes[20:]
+	for pos := 0; pos < len(body); {
+		if len(body)-pos < 4 {
+			return nil, errors.New("truncated STUN attribute")
 		}
-		value := packetBytes[pos+4 : end]
-		attribute := newAttribute(types, value)
-		pkt.addAttribute(*attribute)
-		pos += align(length) + 4
+		types := binary.BigEndian.Uint16(body[pos : pos+2])
+		length := int(binary.BigEndian.Uint16(body[pos+2 : pos+4]))
+		padded := (length + 3) &^ 3
+		if padded > len(body)-pos-4 {
+			return nil, errors.New("truncated STUN attribute value")
+		}
+		value := body[pos+4 : pos+4+length]
+		switch types {
+		case attributeMappedAddress, attributeSourceAddress, attributeChangedAddress,
+			attributeOtherAddress, attributeXorMappedAddress, attributeXorMappedAddressExp:
+			if !validAddressAttribute(value) {
+				return nil, errors.New("invalid STUN address attribute")
+			}
+		}
+		pkt.addAttribute(*newAttribute(types, value))
+		pos += 4 + padded
 	}
 	return pkt, nil
 }

@@ -282,8 +282,8 @@ class BaseService {
             else startService(Intent(this, javaClass))
         }
 
-        fun killProcesses() {
-            data.proxy?.close()
+        suspend fun killProcesses() {
+            onIoDispatcher { data.proxy?.close() }
             wakeLock?.apply {
                 release()
                 wakeLock = null
@@ -322,7 +322,9 @@ class BaseService {
                 data.connectingJob?.cancelAndJoin() // ensure stop connecting first
                 // we use a coroutineScope here to allow clean-up in parallel
                 coroutineScope {
-                    killProcesses()
+                    withContext(NonCancellable) {
+                        try { killProcesses() } catch (e: Exception) { Logs.w(e) }
+                    }
                     val data = data
                     if (data.closeReceiverRegistered) {
                         unregisterReceiver(data.receiver)
@@ -454,8 +456,13 @@ class BaseService {
             val profile = SagerDatabase.proxyDao.getById(DataStore.selectedProxy)
             this as Context
             if (profile == null) { // gracefully shutdown: https://stackoverflow.com/q/47337857/2245107
-                data.notification = createNotification("")
-                stopRunner(false, getString(R.string.profile_empty))
+                runOnMainDispatcher {
+                    try {
+                        data.notification = createNotification("")
+                        data.notification!!.start()
+                    } catch (e: Exception) { Logs.w(e) }
+                    finally { stopRunner(false, getString(R.string.profile_empty)) }
+                }
                 return Service.START_NOT_STICKY
             }
 
@@ -498,6 +505,7 @@ class BaseService {
             data.connectingJob = runOnMainDispatcher {
                 try {
                     data.notification = createNotification(ServiceNotification.genTitle(profile))
+                    data.notification!!.start()
 
                     Executable.killAll()    // clean up old processes
                     preInit()

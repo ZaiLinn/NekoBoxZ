@@ -11,6 +11,7 @@ import androidx.core.view.isInvisible
 import androidx.recyclerview.widget.ItemTouchHelper
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.snackbar.Snackbar
+import io.nekohasekai.sagernet.utils.BoundedInput
 import io.nekohasekai.sagernet.R
 import io.nekohasekai.sagernet.database.DataStore
 import io.nekohasekai.sagernet.databinding.LayoutAssetItemBinding
@@ -111,21 +112,23 @@ class AssetsActivity : ThemedActivity() {
             val filesDir = getExternalFilesDir(null) ?: filesDir
 
             runOnDefaultDispatcher {
-                val outFile = File(filesDir, fileName).apply {
-                    parentFile?.mkdirs()
+                try {
+                    val outFile = BoundedInput.assetTarget(filesDir, fileName)
+                    val temporary = File.createTempFile("import-", ".tmp", filesDir)
+                    try {
+                        val bytes = contentResolver.openInputStream(file)?.use { input ->
+                            temporary.outputStream().use { output ->
+                                BoundedInput.copy(input, output, BoundedInput.MAX_ASSET.toLong())
+                            }
+                        } ?: error("Cannot open asset")
+                        require(bytes > 0) { "Empty asset" }
+                        check(temporary.renameTo(outFile)) { "Cannot replace asset" }
+                        File(outFile.parentFile, outFile.nameWithoutExtension + ".version.txt").writeText("Custom")
+                    } finally { temporary.delete() }
+                    onMainDispatcher { adapter.reloadAssets() }
+                } catch (e: Exception) {
+                    onMainDispatcher { alert(e.readableMessage).tryToShow() }
                 }
-
-                contentResolver.openInputStream(file)?.use(outFile.outputStream())
-
-                File(outFile.parentFile, outFile.nameWithoutExtension + ".version.txt").apply {
-                    if (isFile) delete()
-                    createNewFile()
-                    val fw = FileWriter(this)
-                    fw.write("Custom")
-                    fw.close()
-                }
-
-                adapter.reloadAssets()
             }
 
         }
@@ -317,7 +320,7 @@ class AssetsActivity : ThemedActivity() {
                 Libcore.unxz(cacheFile.absolutePath, file.absolutePath)
                 cacheFile.delete()
             } else {
-                cacheFile.renameTo(file)
+                check(cacheFile.renameTo(file)) { "Cannot replace asset" }
             }
 
             versionFile.writeText(tagName)

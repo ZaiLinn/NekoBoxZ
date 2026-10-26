@@ -14,6 +14,8 @@ import io.nekohasekai.sagernet.R
 import io.nekohasekai.sagernet.database.DataStore
 import io.nekohasekai.sagernet.databinding.LayoutWebviewBinding
 import moe.matsuri.nb4a.utils.WebViewUtil
+import io.nekohasekai.sagernet.utils.ControlApi
+import io.nekohasekai.sagernet.SagerNet
 
 // Fragment必须有一个无参public的构造函数，否则在数据恢复的时候，会报crash
 
@@ -29,6 +31,7 @@ class WebviewFragment : ToolbarFragment(R.layout.layout_webview), Toolbar.OnMenu
         toolbar.setTitle(R.string.menu_dashboard)
         toolbar.inflateMenu(R.menu.yacd_menu)
         toolbar.setOnMenuItemClickListener(this)
+        toolbar.menu.add(0, COPY_API_SECRET, 0, R.string.copy_api_secret)
 
         val binding = LayoutWebviewBinding.bind(view)
 
@@ -48,12 +51,13 @@ class WebviewFragment : ToolbarFragment(R.layout.layout_webview), Toolbar.OnMenu
                 super.onPageFinished(view, url)
             }
         }
-        mWebView.loadUrl(DataStore.yacdURL)
+        mWebView.loadUrl(ControlApi.panelUrl(DataStore.yacdURL))
     }
 
     @SuppressLint("CheckResult")
     override fun onMenuItemClick(item: MenuItem): Boolean {
         when (item.itemId) {
+            COPY_API_SECRET -> SagerNet.trySetPrimaryClip(ControlApi.secret())
             R.id.action_set_url -> {
                 val view = EditText(context).apply {
                     inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
@@ -63,7 +67,7 @@ class WebviewFragment : ToolbarFragment(R.layout.layout_webview), Toolbar.OnMenu
                     .setView(view)
                     .setPositiveButton(android.R.string.ok) { _, _ ->
                         DataStore.yacdURL = view.text.toString()
-                        mWebView.loadUrl(DataStore.yacdURL)
+                        mWebView.loadUrl(ControlApi.panelUrl(DataStore.yacdURL))
                     }
                     .setNegativeButton(android.R.string.cancel, null)
                     .show()
@@ -76,4 +80,5 @@ class WebviewFragment : ToolbarFragment(R.layout.layout_webview), Toolbar.OnMenu
         }
         return true
     }
+    companion object { private const val COPY_API_SECRET = android.view.Menu.FIRST + 9090 }
 }

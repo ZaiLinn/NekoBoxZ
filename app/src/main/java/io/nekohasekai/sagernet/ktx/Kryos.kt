@@ -13,7 +13,9 @@ fun OutputStream.byteBuffer() = ByteBufferOutput(this)
 
 fun ByteBufferInput.readStringList(): List<String> {
     return mutableListOf<String>().apply {
-        repeat(readInt()) {
+        val count = readInt()
+        require(count in 0..10_000) { "Collection too large" }
+        repeat(count) {
             add(readString())
         }
     }
@@ -21,7 +23,9 @@ fun ByteBufferInput.readStringList(): List<String> {
 
 fun ByteBufferInput.readStringSet(): Set<String> {
     return linkedSetOf<String>().apply {
-        repeat(readInt()) {
+        val count = readInt()
+        require(count in 0..10_000) { "Collection too large" }
+        repeat(count) {
             add(readString())
         }
     }

@@ -17,7 +17,8 @@ import io.nekohasekai.sagernet.ktx.runOnMainDispatcher
 
 class SagerConnection(
     private var connectionId: Int,
-    private var listenForDeath: Boolean = false
+    private var listenForDeath: Boolean = false,
+    private val serviceClassOverride: Class<*>? = null,
 ) : ServiceConnection, IBinder.DeathRecipient {
 
     companion object {
@@ -159,7 +160,7 @@ class SagerConnection(
         connectionActive = true
         check(this.callback == null)
         this.callback = callback
-        val intent = Intent(context, serviceClass).setAction(Action.SERVICE)
+        val intent = Intent(context, serviceClassOverride ?: serviceClass).setAction(Action.SERVICE)
         context.bindService(intent, this, Context.BIND_AUTO_CREATE)
     }
 
