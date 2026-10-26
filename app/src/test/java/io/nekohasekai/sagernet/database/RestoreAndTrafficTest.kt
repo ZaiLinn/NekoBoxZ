@@ -54,16 +54,44 @@ class RestoreAndTrafficTest {
         Assert.assertEquals("keep", db.rulesDao().allRules().single().name)
     }
 
+    private fun setRollbackMode(mode: String) {
+        for (database in listOf(db.openHelper.writableDatabase, settings.openHelper.writableDatabase)) {
+            database.query("PRAGMA journal_mode=$mode").use {
+                Assert.assertTrue(it.moveToFirst())
+                Assert.assertEquals(mode, it.getString(0).lowercase(java.util.Locale.ROOT))
+            }
+        }
+    }
+
+    @Test fun restoreAcceptsAllOnDiskRollbackModes() {
+        for (mode in listOf("delete", "truncate", "persist")) {
+            setRollbackMode(mode)
+            db.rulesDao().reset()
+            db.rulesDao().insert(listOf(RuleEntity(id = 1, name = "old")))
+            settings.keyValuePairDao().put(KeyValuePair("old").put("keep"))
+            BackupRestore.restore(BackupRestore.Plan(null, null,
+                listOf(RuleEntity(id = 2, name = mode)), listOf(KeyValuePair("new").put(mode))),
+                db, settings)
+            Assert.assertEquals(mode, db.rulesDao().allRules().single().name)
+            Assert.assertNull(settings.keyValuePairDao()["old"])
+            Assert.assertEquals(mode, settings.keyValuePairDao()["new"]!!.string)
+        }
+    }
+
     @Test fun secondDatabaseFailureRollsBackBothDatabases() {
-        db.rulesDao().insert(listOf(RuleEntity(id = 1, name = "keep")))
-        settings.keyValuePairDao().put(KeyValuePair("old").put("keep"))
-        // Duplicate keys force a constraint failure after the new rule has been inserted.
-        val plan = BackupRestore.Plan(null, null, listOf(RuleEntity(id = 2, name = "new")),
-            listOf(KeyValuePair("duplicate").put("a"), KeyValuePair("duplicate").put("b")))
-        try { BackupRestore.restore(plan, db, settings); Assert.fail("expected constraint failure") }
-        catch (_: android.database.sqlite.SQLiteException) {}
-        Assert.assertEquals("keep", db.rulesDao().allRules().single().name)
-        Assert.assertEquals("keep", settings.keyValuePairDao()["old"]!!.string)
-        Assert.assertNull(settings.keyValuePairDao()["duplicate"])
+        for (mode in listOf("delete", "truncate", "persist")) {
+            setRollbackMode(mode)
+            db.rulesDao().reset()
+            db.rulesDao().insert(listOf(RuleEntity(id = 1, name = "keep")))
+            settings.keyValuePairDao().put(KeyValuePair("old").put("keep"))
+            // Fail in the second file after the first file has already been changed.
+            val plan = BackupRestore.Plan(null, null, listOf(RuleEntity(id = 2, name = "new")),
+                listOf(KeyValuePair("duplicate").put("a"), KeyValuePair("duplicate").put("b")))
+            try { BackupRestore.restore(plan, db, settings); Assert.fail("expected constraint failure") }
+            catch (_: android.database.sqlite.SQLiteException) {}
+            Assert.assertEquals(mode, "keep", db.rulesDao().allRules().single().name)
+            Assert.assertEquals(mode, "keep", settings.keyValuePairDao()["old"]!!.string)
+            Assert.assertNull(settings.keyValuePairDao()["duplicate"])
+        }
     }
 }
