@@ -32,6 +32,9 @@ jobs:
           distribution: temurin
           java-version: 17
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
       - name: Install native toolchain
         run: sdkmanager "ndk;25.0.8775105" "platforms;android-35"
       - name: Native Build
@@ -78,6 +81,9 @@ jobs:
           distribution: temurin
           java-version: 17
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
       - name: Install Android toolchain
         run: sdkmanager "ndk;25.0.8775105" "platforms;android-35" "build-tools;35.0.1"
       - name: Build Hev Tunnel
