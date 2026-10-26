@@ -43,3 +43,7 @@ The local sandbox cannot open the Unix protect socket used by the existing full-
 ## Publication status
 
 GitHub App repository access was authorized after the initial 403. The fix branch is being published for CI. The workflow builds a signed debug test APK with a separate application ID so it can be installed alongside the release. Android assembly, Robolectric integration tests and device regressions remain pending until the corresponding checks complete.
+
+## First Android CI result and correction
+
+The native build and full Go race tests passed. Android compilation reached the tests: 72 of 73 passed; the attached-database rollback test failed because the guard incorrectly required the literal `truncate` journal mode. Room's TRUNCATE choice disables WAL but does not guarantee that SQLite returns that string. The guard now accepts the three on-disk rollback modes DELETE/TRUNCATE/PERSIST and still rejects WAL/MEMORY/OFF. Regression tests exercise successful restore and a second-database constraint failure under all three modes. CI must pass on this correction before the APK is considered built.

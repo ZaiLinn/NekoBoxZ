@@ -70,8 +70,11 @@ object BackupRestore {
                 // SQLite multi-file crash atomicity requires on-disk rollback journals, not WAL.
                 for (db in listOf(sql, settingsSql)) {
                     db.query("PRAGMA journal_mode").use {
-                        check(it.moveToFirst() && it.getString(0).equals("truncate", true)) {
-                            "Restore requires rollback journals"
+                        check(it.moveToFirst()) { "Cannot read database journal mode" }
+                        val mode = it.getString(0).lowercase(java.util.Locale.ROOT)
+                        // Room's TRUNCATE setting disables WAL; Android may use DELETE or PERSIST.
+                        check(mode in setOf("delete", "truncate", "persist")) {
+                            "Restore requires on-disk rollback journals (found $mode)"
                         }
                     }
                 }
