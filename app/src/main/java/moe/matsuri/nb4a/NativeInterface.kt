@@ -100,12 +100,15 @@ class NativeInterface : BoxPlatformInterface, NB4AInterface {
         }
         Libcore.resetAllConnections(true)
         DataStore.baseService?.apply {
+            val proxy = data.proxy?.takeIf { it.isInitialized() } ?: return@apply
             runOnDefaultDispatcher {
-                val id = data.proxy!!.config.profileTagMap
+                if (data.proxy !== proxy) return@runOnDefaultDispatcher
+                val id = proxy.config.profileTagMap
                     .filterValues { it == tag }.keys.firstOrNull() ?: -1
                 val ent = SagerDatabase.proxyDao.getById(id) ?: return@runOnDefaultDispatcher
                 // traffic & title
-                data.proxy?.apply {
+                if (data.proxy !== proxy) return@runOnDefaultDispatcher
+                proxy.apply {
                     looper?.selectMain(id)
                     displayProfileName = ServiceNotification.genTitle(ent)
                     data.notification?.postNotificationTitle(displayProfileName)

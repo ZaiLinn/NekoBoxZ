@@ -44,8 +44,8 @@ class TransproxyRulesTest {
             ip rule add fwmark 0x2096 table 2096
         """.trimIndent()
         val out = Transproxy.xtablesWait(script)
-        assertEquals(4, Regex("ip6?tables -w ").findAll(out).count())
+        assertEquals(4, Regex("ip6?tables -w 5 ").findAll(out).count())
         assertFalse(out.contains("ip rule add fwmark 0x2096 table 2096 -w"))
-        assertFalse(Regex("ip6?tables (?!-w)").containsMatchIn(out))
+        assertFalse(Regex("ip6?tables (?!-w 5)").containsMatchIn(out))
     }
 }

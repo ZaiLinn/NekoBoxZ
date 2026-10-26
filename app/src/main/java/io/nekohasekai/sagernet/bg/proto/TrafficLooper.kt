@@ -7,11 +7,14 @@ import io.nekohasekai.sagernet.bg.BaseService
 import io.nekohasekai.sagernet.bg.SagerConnection
 import io.nekohasekai.sagernet.database.DataStore
 import io.nekohasekai.sagernet.database.ProfileManager
+import io.nekohasekai.sagernet.database.SagerDatabase
 import io.nekohasekai.sagernet.fmt.TAG_BYPASS
 import io.nekohasekai.sagernet.fmt.TAG_PROXY
 import io.nekohasekai.sagernet.ktx.Logs
 import io.nekohasekai.sagernet.ktx.runOnDefaultDispatcher
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class TrafficLooper
     (
@@ -22,33 +25,51 @@ class TrafficLooper
     private var trafficUpdater: TrafficUpdater? = null
     private val idMap = mutableMapOf<Long, TrafficUpdater.TrafficLooperData>() // id to 1 data
     private val tagMap = mutableMapOf<String, TrafficUpdater.TrafficLooperData>() // tag to 1 data
+    private val saveLock = Mutex()
+    private val stateLock = Mutex()
+    @Volatile private var stopped = false
+    private val savedTraffic = mutableMapOf<Long, Pair<Long, Long>>()
+
+    private suspend fun saveTraffic(id: Long, item: TrafficUpdater.TrafficLooperData) = saveLock.withLock {
+        val rxNow = item.rx
+        val txNow = item.tx
+        val previous = savedTraffic[id] ?: (item.rxBase to item.txBase)
+        val rx = (rxNow - previous.first).coerceAtLeast(0)
+        val tx = (txNow - previous.second).coerceAtLeast(0)
+        if (SagerDatabase.proxyDao.addTraffic(id, rx, tx) == 0) return@withLock
+        savedTraffic[id] = rxNow to txNow
+        val current = SagerDatabase.proxyDao.getById(id) ?: return@withLock
+        ProfileManager.postUpdate(TrafficData(id = id, rx = current.rx, tx = current.tx))
+    }
 
     suspend fun stop() {
+        stopped = true
         job?.cancelAndJoin()
-        // finally traffic post
-        if (!DataStore.profileTrafficStatistics) return
-        // collect traffic since the last update (including while polling was paused)
-        runCatching { trafficUpdater?.updateAll() }
-        val traffic = mutableMapOf<Long, TrafficData>()
-        data.proxy?.config?.trafficMap?.forEach { (_, ents) ->
-            for (ent in ents) {
-                val item = idMap[ent.id] ?: return@forEach
-                ent.rx = item.rx
-                ent.tx = item.tx
-                ProfileManager.updateProfile(ent) // update DB
-                traffic[ent.id] = TrafficData(
-                    id = ent.id,
-                    rx = ent.rx,
-                    tx = ent.tx,
-                )
+        stateLock.withLock {
+            // finally traffic post
+            if (!DataStore.profileTrafficStatistics) return
+            // collect traffic since the last update (including while polling was paused)
+            runCatching { trafficUpdater?.updateAll() }
+            val traffic = mutableMapOf<Long, TrafficData>()
+            data.proxy?.config?.trafficMap?.forEach { (_, ents) ->
+                for (ent in ents) {
+                    val item = idMap[ent.id] ?: return@forEach
+                    saveTraffic(ent.id, item)
+                    val current = SagerDatabase.proxyDao.getById(ent.id) ?: continue
+                    traffic[ent.id] = TrafficData(
+                        id = ent.id,
+                        rx = current.rx,
+                        tx = current.tx,
+                    )
+                }
             }
-        }
-        data.binder.broadcast { b ->
-            for (t in traffic) {
-                b.cbTrafficUpdate(t.value)
+            data.binder.broadcast { b ->
+                for (t in traffic) {
+                    b.cbTrafficUpdate(t.value)
+                }
             }
+            Logs.d("finally traffic post done")
         }
-        Logs.d("finally traffic post done")
     }
 
     fun start() {
@@ -58,21 +79,18 @@ class TrafficLooper
     var selectorNowId = -114514L
     var selectorNowFakeTag = ""
 
-    fun selectMain(id: Long) {
+    suspend fun selectMain(id: Long) = stateLock.withLock {
+        if (stopped) return@withLock
         Logs.d("select traffic count $TAG_PROXY to $id, old id is $selectorNowId")
         val oldData = idMap[selectorNowId]
-        val newData = idMap[id] ?: return
+        val newData = idMap[id] ?: return@withLock
         oldData?.apply {
             tag = selectorNowFakeTag
             ignore = true
             // post traffic when switch
             if (DataStore.profileTrafficStatistics) {
                 data.proxy?.config?.trafficMap?.get(tag)?.firstOrNull()?.let {
-                    it.rx = rx
-                    it.tx = tx
-                    runOnDefaultDispatcher {
-                        ProfileManager.updateProfile(it) // update DB
-                    }
+                    saveTraffic(it.id, this@apply)
                 }
             }
         }

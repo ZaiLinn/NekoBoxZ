@@ -60,22 +60,35 @@ object Transproxy {
 
     class RootException(message: String) : IOException(message), BaseService.ExpectedException
 
+    @Volatile private var generation = ""
+    private fun activeToken() = runCatching { flagFile.readText() }.getOrDefault("")
+    fun tunnelFailed() = File(runDir, "failed-$generation").exists()
+
+    private fun scriptLock() = buildString {
+        appendLine("exec 9>'${runDir.absolutePath}/rules.lock'")
+        appendLine("i=0; until flock -n 9; do i=\$((i+1)); [ \$i -lt 100 ] || exit 1; sleep 0.1; done")
+    }
+
+    @Synchronized
     fun start() {
         val bin = File(app.applicationInfo.nativeLibraryDir, BIN)
         if (!bin.exists()) throw RootException(app.getString(R.string.transproxy_failed, "$BIN not found"))
-        flagFile.createNewFile()
+        cleanup()
+        generation = java.util.UUID.randomUUID().toString()
+        flagFile.writeText(generation)
         File(runDir, "hev.yml").writeText(hevConfig())
         // run by the root watchdog when the core dies without a cleanup (crash, force stop)
-        File(runDir, "cleanup.sh").writeText(xtablesWait(cleanupScript(byWatchdog = true)))
+        File(runDir, "cleanup-$generation.sh").writeText(xtablesWait(cleanupScript(byWatchdog = true)))
         try {
-            runSu(cleanupScript() + "\n" + setupScript(bin))
+            runSu(setupScript(bin))
         } catch (e: Exception) {
-            cleanup()
+            try { cleanup() } catch (failure: Exception) { e.addSuppressed(failure) }
             throw e
         }
         Logs.i("transproxy: started")
     }
 
+    @Synchronized
     fun cleanup() {
         if (!flagFile.exists()) return
         try {
@@ -84,6 +97,7 @@ object Transproxy {
             Logs.i("transproxy: rules removed")
         } catch (e: Exception) {
             Logs.w(e)
+            throw e // preserve the active marker until cleanup is verified
         }
     }
 
@@ -106,16 +120,23 @@ object Transproxy {
         val dir = runDir.absolutePath
         val corePid = Process.myPid()
         appendLine("set -e")
-        // Pin the core's LMK priority (system_server keeps resetting it, so re-pin in a loop).
-        // The loop runs only while the core is alive (same pid and start time, as pids are
-        // reused), then removes the rules itself, since the dead core can't do it.
+        append(scriptLock())
+        appendLine("iptables -t mangle -S >/dev/null")
+        appendLine("ip6tables -t filter -S >/dev/null")
+        if (ipv6) appendLine("ip6tables -t mangle -S >/dev/null")
+        appendLine("[ -z \"\$(ip route show table $TABLE 2>/dev/null)\" ] || { echo 'routing table already in use'; exit 1; }")
+        appendLine("[ -z \"\$(ip rule show | grep -E '^[[:space:]]*$PRIORITY:')\" ] || { echo 'routing priority already in use'; exit 1; }")
+        appendLine("touch '$dir/owned'")
+        appendLine("SETUP_OK=0; trap 'flock -u 9; exec 9>&-; [ \"\$SETUP_OK\" = 1 ] || sh \"$dir/cleanup-${activeToken()}.sh\"' EXIT")
         appendLine("CORE_START=\$(cut -d' ' -f22 /proc/$corePid/stat)")
-        appendLine("nohup sh -c 'while [ \"\$(cut -d\" \" -f22 /proc/$corePid/stat 2>/dev/null)\" = \"'\$CORE_START'\" ]; do echo $OOM_SCORE > /proc/$corePid/oom_score_adj 2>/dev/null; sleep 5; done; rm -f \"$dir/oomguard.pid\"; sh \"$dir/cleanup.sh\"' >/dev/null 2>&1 &")
-        appendLine("echo \$! > '$dir/oomguard.pid'")
+        appendLine("mkdir -p '$dir/sysctl'")
+        appendLine("cat /proc/sys/net/ipv4/conf/all/rp_filter > '$dir/sysctl/rp_filter'")
+        if (DataStore.rootLanSharing) appendLine("cat /proc/sys/net/ipv4/ip_forward > '$dir/sysctl/ip_forward'")
         appendLine("if [ ! -e /dev/net/tun ]; then mkdir -p /dev/net; mknod /dev/net/tun c 10 200; chmod 666 /dev/net/tun; fi")
-        appendLine("nohup '${bin.absolutePath}' '$dir/hev.yml' >'$dir/hev.log' 2>&1 &")
+        appendLine("nohup '${bin.absolutePath}' '$dir/hev.yml' >'$dir/hev.log' 2>&1 9>&- &")
         appendLine("HEV_PID=\$!")
         appendLine("echo \$HEV_PID > '$dir/hev.pid'")
+        appendLine("cut -d' ' -f22 /proc/\$HEV_PID/stat > '$dir/hev.start'")
         appendLine("echo $OOM_SCORE > /proc/\$HEV_PID/oom_score_adj 2>/dev/null || true")
         appendLine("i=0; while [ \$i -lt 20 ]; do ip link show $TUN >/dev/null 2>&1 && break; sleep 0.3; i=\$((i+1)); done")
         appendLine("ip link show $TUN >/dev/null 2>&1 || { echo 'tun device did not come up'; cat '$dir/hev.log'; exit 1; }")
@@ -127,16 +148,20 @@ object Transproxy {
         appendLine("ip rule add fwmark $MARK table $TABLE priority $PRIORITY")
         append(markRules("iptables", BYPASS_V4))
         if (DataStore.rootLanSharing) append(lanSharingRules())
-        // IPv6 is best effort: never fail the working IPv4 setup over it
-        appendLine("set +e")
+        // The advertised IPv6 capture/block policy is mandatory, not best effort.
         if (ipv6) {
             appendLine("ip -6 addr add $TUN_ADDR_V6 dev $TUN 2>/dev/null")
             appendLine("ip -6 route replace default dev $TUN table $TABLE 2>/dev/null")
-            appendLine("ip -6 rule add fwmark $MARK table $TABLE priority $PRIORITY 2>/dev/null")
+            appendLine("ip -6 rule add fwmark $MARK table $TABLE priority $PRIORITY")
             append(markRules("ip6tables", BYPASS_V6))
         } else {
             append(v6RejectRules())
         }
+        // Supervise both processes. The root watcher can restore networking even if Java dies.
+        appendLine("nohup sh -c 'while [ \"\$(cut -d\" \" -f22 /proc/$corePid/stat 2>/dev/null)\" = \"'\$CORE_START'\" ] && [ \"\$(cut -d\" \" -f22 /proc/'\$HEV_PID'/stat 2>/dev/null)\" = \"\$(cat \"$dir/hev.start\" 2>/dev/null)\" ]; do echo $OOM_SCORE > /proc/$corePid/oom_score_adj 2>/dev/null; sleep 2; done; touch \"$dir/failed-${activeToken()}\"; while ! sh \"$dir/cleanup-${activeToken()}.sh\"; do sleep 2; done' >/dev/null 2>&1 9>&- &")
+        appendLine("echo \$! > '$dir/oomguard.pid'")
+        appendLine("cut -d' ' -f22 /proc/\$!/stat > '$dir/oomguard.start'")
+        appendLine("SETUP_OK=1")
         appendLine("exit 0")
     }
 
@@ -178,7 +203,7 @@ object Transproxy {
      * waiting a call fails at once, which under `set -e` fails the whole setup.
      */
     internal fun xtablesWait(script: String) =
-        script.replace(Regex("(?<![\\w-])(ip6?tables)(?= )"), "$1 -w")
+        script.replace(Regex("(?<![\\w-])(ip6?tables)(?= )"), "$1 -w 5")
 
     /** IPv6 disabled: reject captured apps' native IPv6 so they fall back to IPv4 instead of leaking. */
     private fun v6RejectRules() = buildString {
@@ -198,11 +223,10 @@ object Transproxy {
         appendLine("$filter -A OUTPUT -j $CHAIN_V6_REJECT")
     }
 
-    /** Route Wi-Fi hotspot / USB tethering clients through the tun as well. Best effort. */
+    /** Route Wi-Fi hotspot / USB tethering clients through the tun as well. */
     private fun lanSharingRules() = buildString {
         val dns = DataStore.remoteDns.lines().map { it.trim() }
             .firstOrNull { it.matches(Regex("\\d{1,3}(\\.\\d{1,3}){3}")) } ?: LAN_DNS
-        appendLine("set +e")
         appendLine("echo 1 > /proc/sys/net/ipv4/ip_forward")
         appendLine("iptables -N $CHAIN_FWD")
         appendLine("iptables -A $CHAIN_FWD -i $TUN -j ACCEPT")
@@ -216,16 +240,12 @@ object Transproxy {
         }
         appendLine("iptables -t nat -A PREROUTING -j $CHAIN_FWD_DNS")
         // policy routing: replies via main, LAN direct, forwarded clients via the tun table
-        appendLine("ip rule add iif lo goto 6000 pref 5000")
-        appendLine("ip rule add iif $TUN lookup main suppress_prefixlength 0 pref 5010")
-        appendLine("ip rule add iif $TUN goto 6000 pref 5020")
-        appendLine("ip rule add to 10.0.0.0/8 lookup main pref 5025")
-        appendLine("ip rule add to 172.16.0.0/12 lookup main pref 5026")
-        appendLine("ip rule add to 192.168.0.0/16 lookup main pref 5027")
-        appendLine("ip rule add from 10.0.0.0/8 lookup $TABLE pref 5030")
-        appendLine("ip rule add from 172.16.0.0/12 lookup $TABLE pref 5040")
-        appendLine("ip rule add from 192.168.0.0/16 lookup $TABLE pref 5050")
-        appendLine("ip rule add nop pref 6000")
+        for (rule in lanPolicyRules()) {
+            val pref = rule.substringAfterLast("pref ")
+            appendLine("[ -z \"\$(ip rule show | grep -E '^[[:space:]]*$pref:')\" ] || { echo 'LAN routing priority already in use'; exit 1; }")
+        }
+        appendLine("touch '${runDir.absolutePath}/lan.active'")
+        for (rule in lanPolicyRules()) appendLine("ip rule add $rule")
         // clients' native IPv6 would bypass the proxy: tunnel it, or reject when IPv6 is off
         appendLine("ip6tables -N $CHAIN_V6_FWD")
         appendLine("ip6tables -I FORWARD -j $CHAIN_V6_FWD")
@@ -242,6 +262,14 @@ object Transproxy {
         appendLine("ip6tables -A $CHAIN_V6_FWD -j REJECT --reject-with icmp6-no-route")
     }
 
+    internal fun lanPolicyRules() = listOf(
+        "iif lo goto 6000 pref 5000", "iif $TUN lookup main suppress_prefixlength 0 pref 5010",
+        "iif $TUN goto 6000 pref 5020", "to 10.0.0.0/8 lookup main pref 5025",
+        "to 172.16.0.0/12 lookup main pref 5026", "to 192.168.0.0/16 lookup main pref 5027",
+        "from 10.0.0.0/8 lookup $TABLE pref 5030", "from 172.16.0.0/12 lookup $TABLE pref 5040",
+        "from 192.168.0.0/16 lookup $TABLE pref 5050", "nop pref 6000",
+    )
+
     /** @return (proxy only the selected apps, selected uids) */
     private fun selectedApps(): Pair<Boolean, Set<Int>> {
         if (!DataStore.proxyApps) return false to emptySet()
@@ -254,6 +282,12 @@ object Transproxy {
     /** @param byWatchdog run by the watchdog after the core died: its pid may be reused already */
     private fun cleanupScript(byWatchdog: Boolean = false) = buildString {
         val dir = runDir.absolutePath
+        append(scriptLock())
+        appendLine("[ \"\$(cat '$dir/active' 2>/dev/null)\" = '${activeToken()}' ] || exit 0")
+        appendLine("[ -f '$dir/owned' ] || exit 0")
+        appendLine("CLEANUP_OK=1")
+        appendLine("iptables -t mangle -S >/dev/null || CLEANUP_OK=0")
+        appendLine("ip6tables -t filter -S >/dev/null || CLEANUP_OK=0")
         for (cmd in listOf("iptables", "ip6tables")) {
             appendLine("while $cmd -t mangle -D OUTPUT -j $CHAIN 2>/dev/null; do :; done")
             appendLine("$cmd -t mangle -F $CHAIN 2>/dev/null; $cmd -t mangle -X $CHAIN 2>/dev/null")
@@ -262,7 +296,7 @@ object Transproxy {
         appendLine("ip6tables -F $CHAIN_V6_REJECT 2>/dev/null; ip6tables -X $CHAIN_V6_REJECT 2>/dev/null")
         appendLine("while ip rule del fwmark $MARK table $TABLE 2>/dev/null; do :; done")
         appendLine("while ip -6 rule del fwmark $MARK table $TABLE 2>/dev/null; do :; done")
-        appendLine("ip route flush table $TABLE 2>/dev/null; ip -6 route flush table $TABLE 2>/dev/null")
+        appendLine("ip route del default dev $TUN table $TABLE 2>/dev/null; ip -6 route del default dev $TUN table $TABLE 2>/dev/null")
         // LAN sharing (harmless if it was never set up)
         appendLine("while iptables -D FORWARD -j $CHAIN_FWD 2>/dev/null; do :; done")
         appendLine("iptables -F $CHAIN_FWD 2>/dev/null; iptables -X $CHAIN_FWD 2>/dev/null")
@@ -273,18 +307,31 @@ object Transproxy {
         appendLine("ip6tables -F $CHAIN_V6_FWD 2>/dev/null; ip6tables -X $CHAIN_V6_FWD 2>/dev/null")
         appendLine("while ip6tables -t mangle -D PREROUTING -j $CHAIN_V6_PRE 2>/dev/null; do :; done")
         appendLine("ip6tables -t mangle -F $CHAIN_V6_PRE 2>/dev/null; ip6tables -t mangle -X $CHAIN_V6_PRE 2>/dev/null")
-        for (pref in listOf(5000, 5010, 5020, 5025, 5026, 5027, 5030, 5040, 5050, 6000)) {
-            appendLine("ip rule del pref $pref 2>/dev/null")
+        appendLine("if [ -f '$dir/lan.active' ]; then")
+        for (rule in lanPolicyRules()) {
+            appendLine("ip rule del $rule 2>/dev/null || true")
         }
+        appendLine("rm -f '$dir/lan.active'")
+        appendLine("fi")
+        // Restore only settings whose current value is still the value this run installed.
+        appendLine("if [ -f '$dir/sysctl/rp_filter' ]; then if [ \"\$(cat /proc/sys/net/ipv4/conf/all/rp_filter)\" = 0 ]; then cat '$dir/sysctl/rp_filter' > /proc/sys/net/ipv4/conf/all/rp_filter || exit 1; fi; rm '$dir/sysctl/rp_filter'; fi")
+        appendLine("if [ -f '$dir/sysctl/ip_forward' ]; then if [ \"\$(cat /proc/sys/net/ipv4/ip_forward)\" = 1 ]; then cat '$dir/sysctl/ip_forward' > /proc/sys/net/ipv4/ip_forward || exit 1; fi; rm '$dir/sysctl/ip_forward'; fi")
         // tun device, hev and the LMK guard
         appendLine("ip link set dev $TUN down 2>/dev/null")
-        appendLine("[ -f '$dir/hev.pid' ] && kill \$(cat '$dir/hev.pid') 2>/dev/null; rm -f '$dir/hev.pid'")
-        if (byWatchdog) {
-            appendLine("rm -f '$dir/active'")
-        } else {
-            appendLine("[ -f '$dir/oomguard.pid' ] && kill \$(cat '$dir/oomguard.pid') 2>/dev/null; rm -f '$dir/oomguard.pid'")
+        appendLine("if [ -f '$dir/hev.pid' ] && [ -f '$dir/hev.start' ]; then PID=\$(cat '$dir/hev.pid'); if [ \"\$(cut -d' ' -f22 /proc/\$PID/stat 2>/dev/null)\" = \"\$(cat '$dir/hev.start')\" ]; then kill \$PID 2>/dev/null; fi; fi; rm -f '$dir/hev.pid' '$dir/hev.start'")
+        for ((cmd, table, chain) in listOf(
+            Triple("iptables", "mangle", CHAIN), Triple("ip6tables", "mangle", CHAIN),
+            Triple("ip6tables", "filter", CHAIN_V6_REJECT), Triple("iptables", "filter", CHAIN_FWD),
+            Triple("iptables", "nat", CHAIN_FWD_DNS), Triple("ip6tables", "filter", CHAIN_V6_FWD),
+            Triple("ip6tables", "mangle", CHAIN_V6_PRE),
+        )) appendLine("if $cmd -t $table -S $chain >/dev/null 2>&1; then exit 1; fi")
+        appendLine("[ \"\$CLEANUP_OK\" = 1 ] || exit 1")
+        if (!byWatchdog) {
+            appendLine("if [ -f '$dir/oomguard.pid' ] && [ -f '$dir/oomguard.start' ]; then PID=\$(cat '$dir/oomguard.pid'); if [ \"\$(cut -d' ' -f22 /proc/\$PID/stat 2>/dev/null)\" = \"\$(cat '$dir/oomguard.start')\" ]; then kill \$PID 2>/dev/null; fi; fi; rm -f '$dir/oomguard.pid' '$dir/oomguard.start'")
             appendLine("echo 0 > /proc/${Process.myPid()}/oom_score_adj 2>/dev/null")
         }
+        appendLine("rm -f '$dir/owned'")
+        if (byWatchdog) appendLine("rm -f '$dir/active'")
         append("true")
     }
 
@@ -298,18 +345,25 @@ object Transproxy {
         var output = ""
         val reader = Thread {
             output = try {
-                process.inputStream.bufferedReader().readText()
+                String(io.nekohasekai.sagernet.utils.BoundedInput.read(process.inputStream, 128 * 1024), Charsets.UTF_8)
             } catch (_: IOException) {
                 ""
             }
         }
         reader.start()
-        reader.join(SU_TIMEOUT_MS)
-        if (reader.isAlive) {
-            process.destroy()
-            throw RootException(app.getString(R.string.transproxy_root_required))
+        val deadline = android.os.SystemClock.elapsedRealtime() + SU_TIMEOUT_MS
+        var exitCode: Int? = null
+        while (android.os.SystemClock.elapsedRealtime() < deadline) {
+            exitCode = try { process.exitValue() } catch (_: IllegalThreadStateException) { null }
+            if (exitCode != null) break
+            Thread.sleep(20)
         }
-        val exitCode = process.waitFor()
+        if (exitCode == null) {
+            process.destroy()
+            process.inputStream.close()
+            throw RootException("Root command timed out; cleanup will be retried")
+        }
+        reader.join(1000)
         if (exitCode != 0) {
             Logs.w("transproxy: su exited with $exitCode: $output")
             throw RootException(

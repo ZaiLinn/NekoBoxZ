@@ -14,6 +14,9 @@ import io.nekohasekai.sagernet.fmt.trojan_go.TrojanGoBean
 import io.nekohasekai.sagernet.fmt.v2ray.StandardV2RayBean
 import io.nekohasekai.sagernet.fmt.v2ray.isTLS
 import io.nekohasekai.sagernet.ktx.*
+import io.nekohasekai.sagernet.fmt.tuic.TuicBean
+import moe.matsuri.nb4a.proxy.anytls.AnyTLSBean
+import io.nekohasekai.sagernet.utils.selectResolvedAddress
 import kotlinx.coroutines.*
 import java.net.Inet4Address
 import java.net.InetAddress
@@ -47,7 +50,6 @@ abstract class GroupUpdater {
             GroupUpdater.progress[groupId] = progress
             GroupManager.postReload(groupId)
         }
-        val ipv6First = ipv6Mode >= IPv6Mode.PREFER
 
         // the pool's 5 threads stay alive until it is closed, also when the update is cancelled
         try {
@@ -76,7 +78,7 @@ abstract class GroupUpdater {
                             InetAddress.getAllByName(profile.serverAddress).filterNotNull()
                         }
                         if (results.isEmpty()) error("empty response")
-                        rewriteAddress(profile, results, ipv6First)
+                        rewriteAddress(profile, results, ipv6Mode)
                     } catch (e: Exception) {
                         Logs.d("Lookup ${profile.serverAddress} failed: ${e.readableMessage}", e)
                     }
@@ -95,9 +97,9 @@ abstract class GroupUpdater {
     }
 
     protected fun rewriteAddress(
-        bean: AbstractBean, addresses: List<InetAddress>, ipv6First: Boolean
+        bean: AbstractBean, addresses: List<InetAddress>, ipv6Mode: Int
     ) {
-        val address = addresses.sortedBy { (it is Inet4Address) xor ipv6First }[0].hostAddress
+        val address = selectResolvedAddress(addresses, ipv6Mode).hostAddress
 
         with(bean) {
             when (this) {
@@ -118,6 +120,8 @@ abstract class GroupUpdater {
                 is HysteriaBean -> {
                     if (sni.isBlank()) sni = bean.serverAddress
                 }
+                is TuicBean -> if (sni.isBlank()) sni = bean.serverAddress
+                is AnyTLSBean -> if (sni.isBlank()) sni = bean.serverAddress
             }
 
             bean.serverAddress = address
@@ -155,7 +159,7 @@ abstract class GroupUpdater {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                Logs.w(e)
+                Logs.w("Subscription update failed (${e.javaClass.simpleName})")
                 GroupManager.userInterface?.onUpdateFailure(proxyGroup, e.readableMessage)
                 return false
             } finally {

@@ -4,7 +4,11 @@ import android.annotation.SuppressLint
 import android.app.Service
 import android.content.Intent
 import android.os.PowerManager
+import io.nekohasekai.sagernet.ktx.runOnDefaultDispatcher
+import io.nekohasekai.sagernet.ktx.onMainDispatcher
+import kotlinx.coroutines.*
 import io.nekohasekai.sagernet.Key
+import io.nekohasekai.sagernet.R
 import io.nekohasekai.sagernet.SagerNet
 import io.nekohasekai.sagernet.database.DataStore
 import io.nekohasekai.sagernet.ktx.onIoDispatcher
@@ -24,18 +28,32 @@ class ProxyService : Service(), BaseService.Interface {
             .apply { acquire() }
     }
 
+    private var tunnelMonitor: Job? = null
+
     override suspend fun startProcesses() {
         // remove leftover rules (e.g. after a crash) before anything else
         onIoDispatcher { Transproxy.cleanup() }
         super.startProcesses()
         // root transparent proxy: hev-socks5-tunnel forwards the captured traffic to the mixed inbound
-        if (DataStore.serviceMode == Key.MODE_TRANS) onIoDispatcher { Transproxy.start() }
+        if (DataStore.serviceMode == Key.MODE_TRANS) {
+            onIoDispatcher { Transproxy.start() }
+            tunnelMonitor = runOnDefaultDispatcher {
+                while (isActive) {
+                    delay(2000)
+                    if (onIoDispatcher { Transproxy.tunnelFailed() }) {
+                        onMainDispatcher { stopRunner(false, getString(R.string.transproxy_tunnel_exited)) }
+                        break
+                    }
+                }
+            }
+        }
     }
 
-    override fun killProcesses() {
-        // restore normal networking before the core goes away
-        Transproxy.cleanup()
-        super.killProcesses()
+    override suspend fun killProcesses() {
+        tunnelMonitor?.cancel()
+        tunnelMonitor = null
+        try { onIoDispatcher { Transproxy.cleanup() } }
+        finally { super.killProcesses() }
     }
 
     override fun onBind(intent: Intent) = super.onBind(intent)

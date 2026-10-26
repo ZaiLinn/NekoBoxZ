@@ -11,6 +11,7 @@ import java.text.SimpleDateFormat
 import java.util.*
 import java.util.zip.Deflater
 import java.util.zip.Inflater
+import io.nekohasekai.sagernet.utils.BoundedInput
 
 object Util {
 
@@ -61,6 +62,7 @@ object Util {
     }
 
     fun b64Decode(b: String): ByteArray {
+        require(b.length <= BoundedInput.MAX_TEXT) { "Encoded input too large" }
         var ret: ByteArray? = null
 
         // padding 自动处理，不用理
@@ -97,23 +99,7 @@ object Util {
     }
 
     fun zlibDecompress(input: ByteArray): ByteArray {
-        val inflater = Inflater()
-        val outputStream = ByteArrayOutputStream()
-
-        return outputStream.use {
-            val buffer = ByteArray(1024)
-
-            inflater.setInput(input)
-
-            var count = -1
-            while (count != 0) {
-                count = inflater.inflate(buffer)
-                outputStream.write(buffer, 0, count)
-            }
-
-            inflater.end()
-            outputStream.toByteArray()
-        }
+        return BoundedInput.inflate(input, BoundedInput.MAX_TEXT)
     }
 
     fun map2StringMap(m: Map<*, *>): MutableMap<String, Any?> {

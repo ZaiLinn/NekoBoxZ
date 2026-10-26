@@ -152,7 +152,9 @@ data class ProxyEntity(
         ping = input.readInt()
         uuid = input.readString()
         error = input.readString()
-        putByteArray(input.readBytes(input.readVarInt(true)))
+        val length = input.readVarInt(true)
+        require(length in 0..(4 * 1024 * 1024) && length <= input.available()) { "Invalid profile length" }
+        putByteArray(input.readBytes(length))
 
         dirty = input.readBoolean()
     }
@@ -520,6 +522,10 @@ data class ProxyEntity(
 
         @Update
         fun updateProxy(proxy: ProxyEntity): Int
+
+        // A running connection only owns its traffic delta, never the editable node snapshot.
+        @Query("UPDATE proxy_entities SET rx = rx + :rx, tx = tx + :tx WHERE id = :id")
+        fun addTraffic(id: Long, rx: Long, tx: Long): Int
 
         @Update
         fun updateProxy(proxies: List<ProxyEntity>): Int

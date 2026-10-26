@@ -53,7 +53,7 @@ public class KryoConverters {
         try {
             bean.deserializeFromBuffer(buffer);
         } catch (KryoException e) {
-            Logs.INSTANCE.w(e);
+            throw new IllegalArgumentException("Invalid serialized configuration", e);
         }
         bean.initializeDefaultValues();
         return bean;

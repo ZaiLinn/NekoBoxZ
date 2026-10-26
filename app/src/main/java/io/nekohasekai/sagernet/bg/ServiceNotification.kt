@@ -7,6 +7,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED
+import android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+import io.nekohasekai.sagernet.Key
 import android.os.Build
 import android.text.format.Formatter
 import android.widget.Toast
@@ -142,10 +144,11 @@ class ServiceNotification(
             addAction(Intent.ACTION_SCREEN_OFF)
         })
 
-        runOnMainDispatcher {
-            updateActions()
-            show()
-        }
+    }
+
+    suspend fun start() {
+        updateActions()
+        show()
     }
 
     private suspend fun updateActions() {
@@ -186,26 +189,15 @@ class ServiceNotification(
     }
 
 
-    private suspend fun show() =
-        useBuilder {
-            try {
-                if (Build.VERSION.SDK_INT >= 34) {
-                    (service as Service).startForeground(
-                        notificationId,
-                        it.build(),
-                        FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED
-                    )
-                } else {
-                    (service as Service).startForeground(notificationId, it.build())
-                }
-            } catch (e: Exception) {
-                Toast.makeText(
-                    SagerNet.application,
-                    "startForeground: $e",
-                    Toast.LENGTH_LONG
-                ).show()
-            }
+    private suspend fun show() = useBuilder {
+        if (Build.VERSION.SDK_INT >= 34) {
+            val type = if (DataStore.serviceMode == Key.MODE_VPN)
+                FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED else FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            (service as Service).startForeground(notificationId, it.build(), type)
+        } else {
+            (service as Service).startForeground(notificationId, it.build())
         }
+    }
 
     private suspend fun update() = useBuilder {
         NotificationManagerCompat.from(service as Service).notify(notificationId, it.build())

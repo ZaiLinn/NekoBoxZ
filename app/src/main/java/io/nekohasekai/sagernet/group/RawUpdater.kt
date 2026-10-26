@@ -1,5 +1,6 @@
 package io.nekohasekai.sagernet.group
 
+import io.nekohasekai.sagernet.utils.BoundedInput
 import android.annotation.SuppressLint
 import io.nekohasekai.sagernet.R
 import io.nekohasekai.sagernet.database.*
@@ -42,6 +43,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CancellationException
 
 /**
  * The YAML loader for Clash subscriptions, which are untrusted: SnakeYAML 2 rejects global
@@ -70,8 +72,7 @@ object RawUpdater : GroupUpdater() {
         val parsed: ProxyParseResult<AbstractBean>
         if (link.startsWith("content://")) {
             val contentText = app.contentResolver.openInputStream(link.toUri())
-                ?.bufferedReader()
-                ?.readText()
+                ?.use { String(BoundedInput.read(it, BoundedInput.MAX_TEXT), Charsets.UTF_8) }
 
             parsed = contentText?.let { parseRawResult(contentText) }
                 ?: error(app.getString(R.string.no_proxies_found_in_subscription))
@@ -79,7 +80,7 @@ object RawUpdater : GroupUpdater() {
 
             val userAgent = subscription.customUserAgent.takeIf { it.isNotBlank() } ?: USER_AGENT
             val response = try {
-                val response = Libcore.newHttpClient().apply {
+                Libcore.newHttpClient().apply {
                     trySocks5(DataStore.mixedPort)
                     tryH3Direct()
                     when (DataStore.appTLSVersion) {
@@ -91,12 +92,15 @@ object RawUpdater : GroupUpdater() {
                     }
                     setURL(subscription.link)
                     setUserAgent(userAgent)
-                }.execute()
-                SubscriptionResponse(
-                    Util.getStringBox(response.contentString),
-                    Util.getStringBox(response.getHeader("Subscription-Userinfo")),
-                    Util.getStringBox(response.getHeader("content-disposition")),
-                )
+                }.useResponse { response ->
+                    SubscriptionResponse(
+                        Util.getStringBox(response.contentString),
+                        Util.getStringBox(response.getHeader("Subscription-Userinfo")),
+                        Util.getStringBox(response.getHeader("content-disposition")),
+                    )
+                }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 // While the service runs the request goes through the current proxy; when that
                 // proxy is broken the subscription that would fix it can't be updated. Retry
@@ -128,6 +132,7 @@ object RawUpdater : GroupUpdater() {
         }
 
         var proxies = parsed.proxies
+        require(proxies.size <= BoundedInput.MAX_ENTRIES) { "Too many subscription entries" }
         val invalidLinks = parsed.skipped[ImportSkipReason.INVALID_PROXY_LINK] ?: 0
 
         val proxiesMap = LinkedHashMap<String, AbstractBean>()
@@ -307,11 +312,12 @@ object RawUpdater : GroupUpdater() {
      * Fetches [link] on the underlying network, outside of the VPN and the proxy. Uses the
      * system TLS checks, so "allow insecure" does not apply here.
      */
-    private fun fetchDirect(link: String, userAgent: String): SubscriptionResponse {
+    private suspend fun fetchDirect(link: String, userAgent: String): SubscriptionResponse {
         val network = SagerNet.underlyingNetwork
         val client = OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
+            .callTimeout(30, TimeUnit.SECONDS)
             .apply {
                 if (network != null) {
                     socketFactory(network.socketFactory)
@@ -328,10 +334,10 @@ object RawUpdater : GroupUpdater() {
                 header("Authorization", Credentials.basic(url.username, url.password))
             }
         }.build()
-        client.newCall(request).execute().use { response ->
+        return client.newCall(request).useResponse { response ->
             if (!response.isSuccessful) error("HTTP ${response.code}")
-            return SubscriptionResponse(
-                response.body?.string() ?: "",
+            SubscriptionResponse(
+                response.body?.byteStream()?.use { String(BoundedInput.read(it, BoundedInput.MAX_TEXT), Charsets.UTF_8) } ?: "",
                 response.header("Subscription-Userinfo") ?: "",
                 response.header("content-disposition") ?: "",
             )
@@ -348,6 +354,7 @@ object RawUpdater : GroupUpdater() {
         text: String, fileName: String = "",
     ): ProxyParseResult<AbstractBean>? {
 
+        require(text.length <= BoundedInput.MAX_TEXT) { "Subscription too large" }
         val proxies = mutableListOf<AbstractBean>()
 
         if (text.contains("proxies:")) {
@@ -771,10 +778,10 @@ object RawUpdater : GroupUpdater() {
                                 }
                             }
                             if (ip.isNotBlank()) {
-                                bean.serverAddress = ip
                                 if (bean.sni.isNullOrBlank() && !bean.serverAddress.isNullOrBlank() && !bean.serverAddress.isIpAddress()) {
                                     bean.sni = bean.serverAddress
                                 }
+                                bean.serverAddress = ip
                             }
                             proxies.add(bean)
                         }

@@ -30,7 +30,7 @@ func newAttribute(types uint16, value []byte) *attribute {
 	att := new(attribute)
 	att.types = types
 	att.value = padding(value)
-	att.length = uint16(len(att.value))
+	att.length = uint16(len(value))
 	return att
 }
 
@@ -56,16 +56,28 @@ func newChangeReqAttribute(changeIP bool, changePort bool) *attribute {
 	return newAttribute(attributeChangeRequest, value)
 }
 
-//      0                   1                   2                   3
-//      0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-//     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-//     |x x x x x x x x|    Family     |         X-Port                |
-//     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-//     |                X-Address (Variable)
-//     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	0                   1                   2                   3
+//	0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 //
-//             Figure 6: Format of XOR-MAPPED-ADDRESS Attribute
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |x x x x x x x x|    Family     |         X-Port                |
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |                X-Address (Variable)
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//
+//	Figure 6: Format of XOR-MAPPED-ADDRESS Attribute
+func validAddressAttribute(value []byte) bool {
+	if len(value) < 4 {
+		return false
+	}
+	return value[1] == byte(attributeFamilyIPv4) && len(value) == 8 ||
+		value[1] == byte(attributeFamilyIPV6) && len(value) == 20
+}
+
 func (v *attribute) xorAddr(transID []byte) *Host {
+	if !validAddressAttribute(v.value) || len(transID) != 16 {
+		return nil
+	}
 	xorIP := make([]byte, 16)
 	for i := 0; i < len(v.value)-4; i++ {
 		xorIP[i] = v.value[i+4] ^ transID[i]
@@ -80,18 +92,22 @@ func (v *attribute) xorAddr(transID []byte) *Host {
 	return &Host{family, net.IP(xorIP).String(), port ^ x}
 }
 
-//       0                   1                   2                   3
-//       0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-//      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-//      |0 0 0 0 0 0 0 0|    Family     |           Port                |
-//      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-//      |                                                               |
-//      |                 Address (32 bits or 128 bits)                 |
-//      |                                                               |
-//      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	0                   1                   2                   3
+//	0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 //
-//               Figure 5: Format of MAPPED-ADDRESS Attribute
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |0 0 0 0 0 0 0 0|    Family     |           Port                |
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |                                                               |
+// |                 Address (32 bits or 128 bits)                 |
+// |                                                               |
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//
+//	Figure 5: Format of MAPPED-ADDRESS Attribute
 func (v *attribute) rawAddr() *Host {
+	if !validAddressAttribute(v.value) {
+		return nil
+	}
 	host := new(Host)
 	host.family = uint16(v.value[1])
 	host.port = binary.BigEndian.Uint16(v.value[2:4])

@@ -355,14 +355,3 @@ fun buildSingBoxOutboundHysteriaBean(bean: HysteriaBean): SingBoxOptions.SingBox
         else -> error("error_version $bean.protocolVersion")
     }
 }
-
-fun hopPortsToSingboxList(s: String): List<String> {
-    return s.split(",").mapNotNull {
-        val pRange = it.replace("-", ":")
-        if (pRange.split(":").size == 2) {
-            pRange
-        } else {
-            null
-        }
-    }
-}
