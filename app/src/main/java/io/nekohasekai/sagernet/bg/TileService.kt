@@ -1,16 +1,22 @@
 package io.nekohasekai.sagernet.bg
 
+import android.app.PendingIntent
 import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
 import android.graphics.drawable.Icon
+import android.net.VpnService
 import android.os.Build
 import android.service.quicksettings.Tile
 import androidx.annotation.RequiresApi
+import io.nekohasekai.sagernet.Key
 import io.nekohasekai.sagernet.R
 import io.nekohasekai.sagernet.SagerNet
 import io.nekohasekai.sagernet.aidl.ISagerNetService
+import io.nekohasekai.sagernet.database.DataStore
 import io.nekohasekai.sagernet.database.SagerDatabase
 import io.nekohasekai.sagernet.ktx.Logs
+import io.nekohasekai.sagernet.ui.VpnRequestActivity
 import android.service.quicksettings.TileService as BaseTileService
 
 @RequiresApi(24)
@@ -62,6 +68,9 @@ class TileService : BaseTileService(), SagerConnection.Callback {
     }
 
     override fun onStopListening() {
+        // a tap that never reached the service is dropped: replaying it on a later bind (e.g. from
+        // requestUpdate after a state change) would toggle the service without a user action
+        tapPending = false
         connection.disconnect(this)
         super.onStopListening()
     }
@@ -74,7 +83,6 @@ class TileService : BaseTileService(), SagerConnection.Callback {
         qsTile?.apply {
             label = null
             when (serviceState) {
-                BaseService.State.Idle -> error("serviceState")
                 BaseService.State.Connecting -> {
                     icon = iconBusy
                     state = Tile.STATE_ACTIVE
@@ -91,7 +99,8 @@ class TileService : BaseTileService(), SagerConnection.Callback {
                     state = Tile.STATE_UNAVAILABLE
                 }
 
-                BaseService.State.Stopped -> {
+                // Idle: the binder of a destroyed service, not an error worth killing :bg for
+                BaseService.State.Idle, BaseService.State.Stopped -> {
                     icon = iconIdle
                     state = Tile.STATE_INACTIVE
                 }
@@ -107,8 +116,25 @@ class TileService : BaseTileService(), SagerConnection.Callback {
             true else BaseService.State.values()[service.state].let { state ->
             when {
                 state.canStop -> SagerNet.stopService()
-                state == BaseService.State.Stopped -> SagerNet.startService()
+                state == BaseService.State.Stopped -> start()
             }
         }
+    }
+
+    private fun start() {
+        // The VPN consent dialog can't be shown from the background service, and the service
+        // would stop before startForeground. Ask for it from the tile, which may start activities.
+        if (DataStore.serviceMode == Key.MODE_VPN && VpnService.prepare(this) != null) {
+            val intent = Intent(this, VpnRequestActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            if (Build.VERSION.SDK_INT >= 34) {
+                startActivityAndCollapse(
+                    PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_IMMUTABLE)
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                startActivityAndCollapse(intent)
+            }
+        } else SagerNet.startService()
     }
 }

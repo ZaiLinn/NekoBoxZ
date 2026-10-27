@@ -2,6 +2,7 @@ package io.nekohasekai.sagernet.database
 
 import android.os.Parcel
 import io.nekohasekai.sagernet.database.preference.KeyValuePair
+import io.nekohasekai.sagernet.fmt.KryoConverters
 import io.nekohasekai.sagernet.database.preference.PublicDatabase
 import moe.matsuri.nb4a.utils.Util
 import org.json.JSONObject
@@ -26,22 +27,25 @@ object BackupRestore {
                 try {
                     parcel.unmarshall(bytes, 0, bytes.size)
                     parcel.setDataPosition(0)
+                    KryoConverters.setStrict(true)
                     creator(parcel).also { require(parcel.dataAvail() == 0) { "Invalid backup entry" } }
-                } finally { parcel.recycle() }
+                } finally {
+                    KryoConverters.setStrict(false)
+                    parcel.recycle()
+                }
             }
         }
-        val profiles = if (profile && content.has("profiles")) decode("profiles", ProxyEntity.CREATOR::createFromParcel) else null
-        val groups = if (profiles != null) decode("groups", ProxyGroup.CREATOR::createFromParcel) else null
+        val groups = if (profile && content.has("profiles")) decode("groups", ProxyGroup.CREATOR::createFromParcel) else null
+        // Old backups may hold profiles of a deleted group. They were never shown, so drop them.
+        val profiles = if (groups != null) groups.map { it.id }.toSet().let { ids ->
+            decode("profiles", ProxyEntity.CREATOR::createFromParcel).filter { it.groupId in ids }
+        } else null
         val rules = if (rule && content.has("rules")) decode("rules", ParcelizeBridge::createRule) else null
         val settings = if (setting && content.has("settings")) decode("settings", KeyValuePair.CREATOR::createFromParcel) else null
         fun validIds(ids: List<Long>) = ids.all { it > 0 } && ids.distinct().size == ids.size
         require(profiles == null || validIds(profiles.map { it.id })) { "Invalid profile IDs" }
         require(groups == null || validIds(groups.map { it.id })) { "Invalid group IDs" }
         require(rules == null || validIds(rules.map { it.id })) { "Invalid rule IDs" }
-        if (profiles != null) {
-            val ids = groups!!.map { it.id }.toSet()
-            require(profiles.all { it.groupId in ids }) { "Profile references a missing group" }
-        }
         require(settings == null || settings.map { it.key }.distinct().size == settings.size) { "Duplicate setting keys" }
         settings?.forEach {
             require(it.key.isNotBlank() && it.valueType in 0..6) { "Invalid setting" }

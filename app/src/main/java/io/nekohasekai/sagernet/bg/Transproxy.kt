@@ -66,7 +66,10 @@ object Transproxy {
 
     private fun scriptLock() = buildString {
         appendLine("exec 9>'${runDir.absolutePath}/rules.lock'")
+        // Some ROMs ship neither toybox nor busybox flock: run unlocked there, as before the lock
+        appendLine("if command -v flock >/dev/null 2>&1; then")
         appendLine("i=0; until flock -n 9; do i=\$((i+1)); [ \$i -lt 100 ] || exit 1; sleep 0.1; done")
+        appendLine("fi")
     }
 
     @Synchronized
@@ -74,6 +77,10 @@ object Transproxy {
         val bin = File(app.applicationInfo.nativeLibraryDir, BIN)
         if (!bin.exists()) throw RootException(app.getString(R.string.transproxy_failed, "$BIN not found"))
         cleanup()
+        // the last run is cleaned up: drop its per-run files (a watchdog stops once its script is gone)
+        runDir.listFiles()?.forEach {
+            if (it.name.matches(Regex("(cleanup-.+\\.sh|failed-.+)"))) it.delete()
+        }
         generation = java.util.UUID.randomUUID().toString()
         flagFile.writeText(generation)
         File(runDir, "hev.yml").writeText(hevConfig())
@@ -92,6 +99,11 @@ object Transproxy {
     fun cleanup() {
         if (!flagFile.exists()) return
         try {
+            // Old watchdogs execute this fixed path. Give them the same lock and token guard
+            // before migrating the empty marker, so they cannot later clean a new run.
+            if (activeToken().isEmpty()) {
+                File(runDir, "cleanup.sh").writeText(xtablesWait(cleanupScript(byWatchdog = true)))
+            }
             runSu(cleanupScript())
             flagFile.delete()
             Logs.i("transproxy: rules removed")
@@ -127,7 +139,7 @@ object Transproxy {
         appendLine("[ -z \"\$(ip route show table $TABLE 2>/dev/null)\" ] || { echo 'routing table already in use'; exit 1; }")
         appendLine("[ -z \"\$(ip rule show | grep -E '^[[:space:]]*$PRIORITY:')\" ] || { echo 'routing priority already in use'; exit 1; }")
         appendLine("touch '$dir/owned'")
-        appendLine("SETUP_OK=0; trap 'flock -u 9; exec 9>&-; [ \"\$SETUP_OK\" = 1 ] || sh \"$dir/cleanup-${activeToken()}.sh\"' EXIT")
+        appendLine("SETUP_OK=0; trap 'flock -u 9 2>/dev/null || true; exec 9>&-; [ \"\$SETUP_OK\" = 1 ] || sh \"$dir/cleanup-${activeToken()}.sh\"' EXIT")
         appendLine("CORE_START=\$(cut -d' ' -f22 /proc/$corePid/stat)")
         appendLine("mkdir -p '$dir/sysctl'")
         appendLine("cat /proc/sys/net/ipv4/conf/all/rp_filter > '$dir/sysctl/rp_filter'")
@@ -158,7 +170,7 @@ object Transproxy {
             append(v6RejectRules())
         }
         // Supervise both processes. The root watcher can restore networking even if Java dies.
-        appendLine("nohup sh -c 'while [ \"\$(cut -d\" \" -f22 /proc/$corePid/stat 2>/dev/null)\" = \"'\$CORE_START'\" ] && [ \"\$(cut -d\" \" -f22 /proc/'\$HEV_PID'/stat 2>/dev/null)\" = \"\$(cat \"$dir/hev.start\" 2>/dev/null)\" ]; do echo $OOM_SCORE > /proc/$corePid/oom_score_adj 2>/dev/null; sleep 2; done; touch \"$dir/failed-${activeToken()}\"; while ! sh \"$dir/cleanup-${activeToken()}.sh\"; do sleep 2; done' >/dev/null 2>&1 9>&- &")
+        appendLine("nohup sh -c 'while [ \"\$(cut -d\" \" -f22 /proc/$corePid/stat 2>/dev/null)\" = \"'\$CORE_START'\" ] && [ \"\$(cut -d\" \" -f22 /proc/'\$HEV_PID'/stat 2>/dev/null)\" = \"\$(cat \"$dir/hev.start\" 2>/dev/null)\" ]; do echo $OOM_SCORE > /proc/$corePid/oom_score_adj 2>/dev/null; sleep 2; done; touch \"$dir/failed-${activeToken()}\"; while [ -f \"$dir/cleanup-${activeToken()}.sh\" ] && ! sh \"$dir/cleanup-${activeToken()}.sh\"; do sleep 2; done' >/dev/null 2>&1 9>&- &")
         appendLine("echo \$! > '$dir/oomguard.pid'")
         appendLine("cut -d' ' -f22 /proc/\$!/stat > '$dir/oomguard.start'")
         appendLine("SETUP_OK=1")
@@ -283,8 +295,35 @@ object Transproxy {
     private fun cleanupScript(byWatchdog: Boolean = false) = buildString {
         val dir = runDir.absolutePath
         append(scriptLock())
+        appendLine("[ -f '$dir/active' ] || exit 0")
         appendLine("[ \"\$(cat '$dir/active' 2>/dev/null)\" = '${activeToken()}' ] || exit 0")
-        appendLine("[ -f '$dir/owned' ] || exit 0")
+        appendLine("LEGACY=0; [ ! -f '$dir/legacy.active' ] || LEGACY=1")
+        appendLine("if [ ! -f '$dir/owned' ]; then")
+        appendLine("  [ -z '${activeToken()}' ] || exit 0")
+        appendLine("  LEGACY=1; touch '$dir/owned' '$dir/lan.active' '$dir/legacy.active' || exit 1")
+        appendLine("fi")
+        // Query failures are failures, not evidence that a rule has disappeared. Normalize
+        // iproute2's numeric mark and implicit 'from all' before comparing complete rules.
+        appendLine("rule_absent() {")
+        appendLine("  RULES=\$(ip \"\$1\" rule show) || return 1")
+        appendLine("  RULES=\$(printf '%s\\n' \"\$RULES\" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]][[:space:]]*/ /g' -e 's/: from all /: /' -e 's#0x2096/0xffffffff#0x2096#g' -e 's/fwmark 8342 /fwmark 0x2096 /') || return 1")
+        appendLine("  while IFS= read -r RULE; do case \"\$RULE\" in \"\$2\"|\"\$2 \"*) return 1;; esac; done <<RULES_END")
+        appendLine("\$RULES")
+        appendLine("RULES_END")
+        appendLine("  return 0")
+        appendLine("}")
+        appendLine("route_absent() {")
+        appendLine("  ROUTES=\$(ip \"\$1\" route show table all) || return 1")
+        appendLine("  ROUTES=\$(printf '%s\\n' \"\$ROUTES\" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]][[:space:]]*/ /g') || return 1")
+        appendLine("  while IFS= read -r ROUTE; do")
+        appendLine("    case \"\$ROUTE\" in default\\ *) ;; *) continue;; esac")
+        appendLine("    case \" \$ROUTE \" in *' dev $TUN '*) ;; *) continue;; esac")
+        appendLine("    case \" \$ROUTE \" in *' table $TABLE '*) return 1;; esac")
+        appendLine("  done <<ROUTES_END")
+        appendLine("\$ROUTES")
+        appendLine("ROUTES_END")
+        appendLine("  return 0")
+        appendLine("}")
         appendLine("CLEANUP_OK=1")
         appendLine("iptables -t mangle -S >/dev/null || CLEANUP_OK=0")
         appendLine("ip6tables -t filter -S >/dev/null || CLEANUP_OK=0")
@@ -294,8 +333,8 @@ object Transproxy {
         }
         appendLine("while ip6tables -D OUTPUT -j $CHAIN_V6_REJECT 2>/dev/null; do :; done")
         appendLine("ip6tables -F $CHAIN_V6_REJECT 2>/dev/null; ip6tables -X $CHAIN_V6_REJECT 2>/dev/null")
-        appendLine("while ip rule del fwmark $MARK table $TABLE 2>/dev/null; do :; done")
-        appendLine("while ip -6 rule del fwmark $MARK table $TABLE 2>/dev/null; do :; done")
+        appendLine("while ip -4 rule del fwmark $MARK table $TABLE priority $PRIORITY 2>/dev/null; do :; done")
+        appendLine("while ip -6 rule del fwmark $MARK table $TABLE priority $PRIORITY 2>/dev/null; do :; done")
         appendLine("ip route del default dev $TUN table $TABLE 2>/dev/null; ip -6 route del default dev $TUN table $TABLE 2>/dev/null")
         // LAN sharing (harmless if it was never set up)
         appendLine("while iptables -D FORWARD -j $CHAIN_FWD 2>/dev/null; do :; done")
@@ -309,15 +348,38 @@ object Transproxy {
         appendLine("ip6tables -t mangle -F $CHAIN_V6_PRE 2>/dev/null; ip6tables -t mangle -X $CHAIN_V6_PRE 2>/dev/null")
         appendLine("if [ -f '$dir/lan.active' ]; then")
         for (rule in lanPolicyRules()) {
-            appendLine("ip rule del $rule 2>/dev/null || true")
+            appendLine("while ip -4 rule del $rule 2>/dev/null; do :; done")
         }
-        appendLine("rm -f '$dir/lan.active'")
+        appendLine("fi")
+        for (family in listOf("-4", "-6")) {
+            appendLine("rule_absent $family '$PRIORITY: fwmark 0x${MARK.toString(16)} lookup $TABLE' || exit 1")
+            appendLine("route_absent $family || exit 1")
+        }
+        appendLine("if [ -f '$dir/lan.active' ]; then")
+        for (rule in lanPolicyRules()) {
+            val pref = rule.substringAfterLast("pref ")
+            val selector = rule.substringBeforeLast(" pref ")
+            appendLine("rule_absent -4 '$pref: $selector' || exit 1")
+        }
         appendLine("fi")
         // Restore only settings whose current value is still the value this run installed.
         appendLine("if [ -f '$dir/sysctl/rp_filter' ]; then if [ \"\$(cat /proc/sys/net/ipv4/conf/all/rp_filter)\" = 0 ]; then cat '$dir/sysctl/rp_filter' > /proc/sys/net/ipv4/conf/all/rp_filter || exit 1; fi; rm '$dir/sysctl/rp_filter'; fi")
         appendLine("if [ -f '$dir/sysctl/ip_forward' ]; then if [ \"\$(cat /proc/sys/net/ipv4/ip_forward)\" = 1 ]; then cat '$dir/sysctl/ip_forward' > /proc/sys/net/ipv4/ip_forward || exit 1; fi; rm '$dir/sysctl/ip_forward'; fi")
         // tun device, hev and the LMK guard
         appendLine("ip link set dev $TUN down 2>/dev/null")
+        // Legacy files have no start time. Only signal a process whose command identifies
+        // our tunnel/config or old watchdog; a recycled PID must remain untouched.
+        appendLine("if [ \"\$LEGACY\" = 1 ]; then")
+        for ((name, identity) in listOf("hev" to "$dir/hev.yml", "oomguard" to "$dir/cleanup.sh")) {
+            appendLine("if [ -f '$dir/$name.pid' ] && [ ! -f '$dir/$name.start' ]; then")
+            appendLine("  PID=\$(cat '$dir/$name.pid'); case \"\$PID\" in ''|*[!0-9]*) exit 1;; esac")
+            appendLine("  if [ -e /proc/\$PID/cmdline ]; then")
+            appendLine("    CMD=\$(tr '\\000' '\\n' < /proc/\$PID/cmdline) || exit 1")
+            appendLine("    if printf '%s\\n' \"\$CMD\" | grep -F '$identity' >/dev/null; then kill \"\$PID\" || exit 1; fi")
+            appendLine("  fi")
+            appendLine("fi")
+        }
+        appendLine("fi")
         appendLine("if [ -f '$dir/hev.pid' ] && [ -f '$dir/hev.start' ]; then PID=\$(cat '$dir/hev.pid'); if [ \"\$(cut -d' ' -f22 /proc/\$PID/stat 2>/dev/null)\" = \"\$(cat '$dir/hev.start')\" ]; then kill \$PID 2>/dev/null; fi; fi; rm -f '$dir/hev.pid' '$dir/hev.start'")
         for ((cmd, table, chain) in listOf(
             Triple("iptables", "mangle", CHAIN), Triple("ip6tables", "mangle", CHAIN),
@@ -330,7 +392,7 @@ object Transproxy {
             appendLine("if [ -f '$dir/oomguard.pid' ] && [ -f '$dir/oomguard.start' ]; then PID=\$(cat '$dir/oomguard.pid'); if [ \"\$(cut -d' ' -f22 /proc/\$PID/stat 2>/dev/null)\" = \"\$(cat '$dir/oomguard.start')\" ]; then kill \$PID 2>/dev/null; fi; fi; rm -f '$dir/oomguard.pid' '$dir/oomguard.start'")
             appendLine("echo 0 > /proc/${Process.myPid()}/oom_score_adj 2>/dev/null")
         }
-        appendLine("rm -f '$dir/owned'")
+        appendLine("rm -f '$dir/owned' '$dir/lan.active' '$dir/legacy.active'")
         if (byWatchdog) appendLine("rm -f '$dir/active'")
         append("true")
     }
@@ -361,7 +423,7 @@ object Transproxy {
         if (exitCode == null) {
             process.destroy()
             process.inputStream.close()
-            throw RootException("Root command timed out; cleanup will be retried")
+            throw RootException(app.getString(R.string.transproxy_root_timeout))
         }
         reader.join(1000)
         if (exitCode != 0) {

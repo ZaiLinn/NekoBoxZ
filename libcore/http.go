@@ -22,13 +22,14 @@ import (
 
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/http3"
-	"github.com/sagernet/sing/common/metadata"
-	"github.com/sagernet/sing/protocol/socks"
-	"github.com/sagernet/sing/protocol/socks/socks5"
 )
 
 const maxHTTPText = 32 * 1024 * 1024
 const maxHTTPAsset = 256 * 1024 * 1024
+
+// No total timeout: an asset download may take minutes. A request fails only when it
+// makes no progress (connect, headers or a body read) for this long.
+const httpIdleTimeout = 30 * time.Second
 
 var errFailConnectSocks5 = errors.New("fail connect socks5")
 
@@ -81,7 +82,6 @@ type httpClient struct {
 func NewHttpClient() HTTPClient {
 	client := new(httpClient)
 	client.h1h2Client.Transport = &client.h1h2Transport
-	client.h1h2Client.Timeout = 30 * time.Second
 	client.h1h2Transport.TLSHandshakeTimeout = 10 * time.Second
 	client.h1h2Transport.ResponseHeaderTimeout = 15 * time.Second
 	client.h1h2Transport.MaxResponseHeaderBytes = 1024 * 1024
@@ -124,35 +124,8 @@ func (c *httpClient) PinnedSHA256(sumHex string) {
 
 func (c *httpClient) TrySocks5(port int32) {
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	c.h1h2Transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		for {
-			socksConn, err := dialer.DialContext(ctx, "tcp", "127.0.0.1:"+strconv.Itoa(int(port)))
-			if err != nil {
-				if c.tryH3Direct {
-					return nil, errFailConnectSocks5
-				}
-				break
-			}
-			if deadline, ok := ctx.Deadline(); ok {
-				_ = socksConn.SetDeadline(deadline)
-			}
-			stopCancel := context.AfterFunc(ctx, func() { socksConn.Close() })
-			_, err = socks.ClientHandshake5(socksConn, socks5.CommandConnect, metadata.ParseSocksaddr(addr), "", "")
-			if !stopCancel() && err == nil {
-				err = ctx.Err()
-			}
-			if err != nil {
-				socksConn.Close()
-				if c.tryH3Direct {
-					return nil, errFailConnectSocks5
-				}
-				break
-			}
-			_ = socksConn.SetDeadline(time.Time{})
-			return socksConn, nil
-		}
-		return dialer.DialContext(ctx, network, addr)
-	}
+	c.h1h2Transport.DialContext = socksDialContext(dialer.DialContext,
+		"127.0.0.1:"+strconv.Itoa(int(port)), 10*time.Second, func() bool { return c.tryH3Direct })
 	c.trySocks5 = true
 }
 
@@ -167,7 +140,7 @@ func (c *httpClient) KeepAlive() {
 
 func (c *httpClient) NewRequest() HTTPRequest {
 	req := &httpRequest{httpClient: c}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	req.cancel = cancel
 	req.request = http.Request{
 		Method: "GET",
@@ -241,17 +214,47 @@ func (r *httpRequest) SetContentString(content string) {
 	r.SetContent([]byte(content))
 }
 
+// idleBody cancels the request when a read makes no progress for httpIdleTimeout.
+type idleBody struct {
+	io.ReadCloser
+	timer *time.Timer
+}
+
+func (b *idleBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if n > 0 {
+		b.timer.Reset(httpIdleTimeout)
+	}
+	return n, err
+}
+
+func (b *idleBody) Close() error {
+	b.timer.Stop()
+	return b.ReadCloser.Close()
+}
+
 func (r *httpRequest) Execute() (response HTTPResponse, err error) {
 	defer device.DeferPanicToError("http execute", func(e error) { err = e })
+	timer := time.AfterFunc(httpIdleTimeout, r.cancel)
 	defer func() {
 		if response == nil {
+			timer.Stop()
 			r.cancel()
+		} else if h, ok := response.(*httpResponse); ok {
+			h.Body = &idleBody{ReadCloser: h.Body, timer: timer}
 		}
 	}()
+	return r.execute()
+}
+
+func (r *httpRequest) execute() (HTTPResponse, error) {
 	if r.tryH3Direct && !r.trySocks5 {
 		return r.doH3Direct()
 	}
-	rsp, err := r.h1h2Client.Do(&r.request)
+	// Transport detaches DialContext from request cancellation but preserves values.
+	// Carry the request lifetime through that boundary for TCP/SOCKS negotiation.
+	request := r.request.Clone(context.WithValue(r.request.Context(), httpRequestContextKey{}, r.request.Context()))
+	rsp, err := r.h1h2Client.Do(request)
 	if err != nil {
 		if r.tryH3Direct && errors.Is(err, errFailConnectSocks5) {
 			return r.doH3Direct()

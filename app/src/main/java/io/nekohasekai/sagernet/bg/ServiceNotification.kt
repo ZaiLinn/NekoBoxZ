@@ -8,7 +8,6 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED
 import android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-import io.nekohasekai.sagernet.Key
 import android.os.Build
 import android.text.format.Formatter
 import android.widget.Toast
@@ -191,7 +190,8 @@ class ServiceNotification(
 
     private suspend fun show() = useBuilder {
         if (Build.VERSION.SDK_INT >= 34) {
-            val type = if (DataStore.serviceMode == Key.MODE_VPN)
+            // must match the manifest type of the service class, not the mode preference
+            val type = if (service is VpnService)
                 FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED else FOREGROUND_SERVICE_TYPE_SPECIAL_USE
             (service as Service).startForeground(notificationId, it.build(), type)
         } else {
