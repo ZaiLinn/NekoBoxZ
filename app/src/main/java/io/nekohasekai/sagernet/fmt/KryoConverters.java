@@ -2,7 +2,6 @@ package io.nekohasekai.sagernet.fmt;
 
 import androidx.room.TypeConverter;
 
-import com.esotericsoftware.kryo.KryoException;
 import com.esotericsoftware.kryo.io.ByteBufferInput;
 import com.esotericsoftware.kryo.io.ByteBufferOutput;
 
@@ -33,6 +32,14 @@ import moe.matsuri.nb4a.utils.JavaUtil;
 
 public class KryoConverters {
 
+    // Strict while parsing an untrusted backup. Rows already in the database stay lenient:
+    // one broken row must not fail the query that loads its whole group.
+    private static final ThreadLocal<Boolean> strict = new ThreadLocal<>();
+
+    public static void setStrict(boolean value) {
+        if (value) strict.set(true); else strict.remove();
+    }
+
     private static final byte[] NULL = new byte[0];
 
     @TypeConverter
@@ -52,8 +59,11 @@ public class KryoConverters {
         ByteBufferInput buffer = KryosKt.byteBuffer(input);
         try {
             bean.deserializeFromBuffer(buffer);
-        } catch (KryoException e) {
-            throw new IllegalArgumentException("Invalid serialized configuration", e);
+        } catch (RuntimeException e) {
+            if (Boolean.TRUE.equals(strict.get())) {
+                throw new IllegalArgumentException("Invalid serialized configuration", e);
+            }
+            Logs.INSTANCE.w(e);
         }
         bean.initializeDefaultValues();
         return bean;

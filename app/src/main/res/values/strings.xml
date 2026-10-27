@@ -59,6 +59,7 @@
     <string name="root_lan_sharing">LAN / hotspot sharing (root)</string>
     <string name="root_lan_sharing_sum">Also route devices connected through Wi-Fi hotspot or USB tethering through the proxy</string>
     <string name="transproxy_root_required">Root transparent proxy requires root access</string>
+    <string name="transproxy_root_timeout">Root command timed out. Check that root access is granted to the app.</string>
     <string name="transproxy_failed">Failed to set iptables rules: %s</string>
     <string name="cag_route">Route Settings</string>
     <string name="allow_access">Allow Connections from the LAN</string>
